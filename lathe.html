@@ -1,0 +1,746 @@
+<!doctype html><meta charset=utf-8><title>lathe</title><style>html,body{margin:0;height:100%;background:#000;overflow:hidden}canvas{width:100%;height:100%;display:block}</style><canvas></canvas><script>// ============================================================================
+// noise bake, brush (cloud holes, mirror wipe), bloom chain, final pass
+// ============================================================================
+// 256² tileable noise, 16 cells across: r, g gradient noise; b cellular distance; a white noise
+const W_NOISE = /*wgsl*/`
+@group(0) @binding(0) var o: texture_storage_2d<rgba8unorm, write>;
+fn pcg(v: u32) -> u32 { let s = v * 747796405u + 2891336453u; let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
+fn hh(c: vec2i, s: u32) -> f32 { let w = (c % vec2i(16) + vec2i(16)) % vec2i(16); return f32(pcg(u32(w.x) + pcg(u32(w.y) + s * 7919u))) / 4294967295.; }
+fn gn(p: vec2f, s: u32) -> f32 {
+  let i = vec2i(floor(p)); let f = fract(p); let u = f * f * f * (f * (f * 6. - 15.) + 10.);
+  var v = array<f32, 4>();
+  for (var k = 0; k < 4; k++) {
+    let o = vec2i(k & 1, k >> 1); let a = hh(i + o, s) * 6.2831853;
+    v[k] = dot(vec2f(cos(a), sin(a)), f - vec2f(o));
+  }
+  return mix(mix(v[0], v[1], u.x), mix(v[2], v[3], u.x), u.y);
+}
+fn wor(p: vec2f) -> f32 {
+  let i = vec2i(floor(p)); let f = fract(p); var d = 9.;
+  for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
+    let o = vec2i(x, y); let c = vec2f(hh(i + o, 3u), hh(i + o, 5u));
+    d = min(d, length(vec2f(o) + c - f));
+  } }
+  return d;
+}
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) g: vec3u) {
+  let p = (vec2f(g.xy) + .5) / 16.;
+  let w = vec4f(gn(p, 1u) * .75 + .5, gn(p, 2u) * .75 + .5, saturate(wor(p) / 1.1), hh(vec2i(g.xy), 9u));
+  textureStore(o, g.xy, saturate(w));
+}
+`;
+// one stroke of the brush into the mask: a capsule from a to b, soft edge, blended with max
+const W_BRUSH = /*wgsl*/`
+struct B { ab: vec4f, rs: vec4f }
+@group(0) @binding(0) var<uniform> b: B;
+struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  var o: VO; o.pos = vec4f(p * 2. - 1., 0., 1.); o.uv = vec2f(p.x, 1. - p.y); return o;
+}
+@fragment fn fs(i: VO) -> @location(0) vec4f {
+  let s = vec2f(b.rs.z, 1.);
+  let pa = (i.uv - b.ab.xy) * s; let ba = (b.ab.zw - b.ab.xy) * s;
+  let h = saturate(dot(pa, ba) / max(dot(ba, ba), 1e-8));
+  let d = length(pa - ba * h);
+  let v = smoothstep(b.rs.x, b.rs.x * .35, d) * b.rs.y;
+  return vec4f(v, v, v, v);
+}
+`;
+const W_BLIT = /*wgsl*/`
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+@group(0) @binding(2) var<uniform> sc: vec4f;      // x, y: share of the source that holds the image
+struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  var o: VO; o.pos = vec4f(p * 2. - 1., 0., 1.); o.uv = vec2f(p.x, 1. - p.y); return o;
+}
+fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(t, s, uv * sc.xy, 0.).rgb; }
+// first step down: a weighted 4-tap that keeps single bright pixels from flickering
+@fragment fn fsDown0(i: VO) -> @location(0) vec4f {
+  let px = 1. / vec2f(textureDimensions(t)) / sc.xy;
+  var c = vec3f(0.); var w = 0.;
+  for (var k = 0; k < 4; k++) {
+    let o = vec2f(f32(k & 1) - .5, f32(k >> 1) - .5) * px * 2.;
+    let v = min(tap(i.uv + o), vec3f(60.)); let ww = 1. / (1. + dot(v, vec3f(.2126, .7152, .0722)));
+    c += v * ww; w += ww;
+  }
+  return vec4f(c / w, 1.);
+}
+@fragment fn fsCopy(i: VO) -> @location(0) vec4f { return vec4f(tap(i.uv), 1.); }
+@fragment fn fsDown(i: VO) -> @location(0) vec4f {
+  let px = 1. / vec2f(textureDimensions(t));
+  var c = vec3f(0.);
+  for (var k = 0; k < 4; k++) { c += tap(i.uv + vec2f(f32(k & 1) - .5, f32(k >> 1) - .5) * px * 2.); }
+  return vec4f(c * .25, 1.);
+}
+@fragment fn fsUp(i: VO) -> @location(0) vec4f {
+  let px = 1. / vec2f(textureDimensions(t));
+  var c = vec3f(0.);
+  for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
+    let w = (2. - abs(f32(x))) * (2. - abs(f32(y)));
+    c += tap(i.uv + vec2f(f32(x), f32(y)) * px) * w;
+  } }
+  return vec4f(c / 16., 1.);
+}
+`;
+const W_POST = /*wgsl*/`
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var tS: texture_2d<f32>;
+@group(0) @binding(2) var tB: texture_2d<f32>;
+@group(0) @binding(3) var tL: texture_2d<f32>;
+@group(0) @binding(4) var sc: sampler;
+struct U { res: vec4f, tm: vec4f, cp: vec4f, ct: vec4f, pt: vec4f, a: vec4f, b: vec4f, c: vec4f, d: vec4f,
+  c0: vec4f, c1: vec4f, c2: vec4f, c3: vec4f, fx: vec4f, fx2: vec4f, sun: vec4f }
+struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  var o: VO; o.pos = vec4f(p * 2. - 1., 0., 1.); o.uv = vec2f(p.x, 1. - p.y); return o;
+}
+fn aces(x: vec3f) -> vec3f { return saturate(x * (2.51 * x + .03) / (x * (2.43 * x + .59) + .14)); }
+fn srgb(c: vec3f) -> vec3f { return select(1.055 * pow(c, vec3f(1. / 2.4)) - .055, c * 12.92, c < vec3f(.0031308)); }
+fn hsh(p: vec2f) -> f32 { var q = fract(p * vec2f(.1031, .1030)); q += dot(q, q.yx + 33.33); return fract((q.x + q.y) * q.x); }
+@fragment fn fs(i: VO) -> @location(0) vec4f {
+  let dim = vec2f(textureDimensions(tS));
+  let s = u.res.xy / dim;
+  let uv = i.uv;
+  // upscale with a light sharpen (the scene renders at a dynamic resolution)
+  let px = 1. / dim;
+  let c0 = textureSampleLevel(tS, sc, uv * s, 0.).rgb;
+  let nb = textureSampleLevel(tS, sc, uv * s + vec2f(px.x, 0.), 0.).rgb + textureSampleLevel(tS, sc, uv * s - vec2f(px.x, 0.), 0.).rgb
+         + textureSampleLevel(tS, sc, uv * s + vec2f(0., px.y), 0.).rgb + textureSampleLevel(tS, sc, uv * s - vec2f(0., px.y), 0.).rgb;
+  var c = max(c0 + (c0 - nb * .25) * .3, vec3f(0.));
+  let low = textureSampleLevel(tL, sc, uv, 0.).rgb;
+  c = mix(c, low, saturate(u.fx.w));
+  c += textureSampleLevel(tB, sc, uv, 0.).rgb * u.fx2.w;
+  // steam over the whole frame (before the pull-back reveals the mirror)
+  if (u.fx2.x > .001) {
+    let asp = u.res.x / u.res.y;
+    let q = vec2f(uv.x * asp, uv.y) * 28.; let id = floor(q);
+    let o = vec2f(hsh(id), hsh(id + 7.1));
+    let dd = length(fract(q) - .5 - (o - .5) * .5); let rr = .12 + .22 * o.y;
+    let drop = smoothstep(rr, rr - .08, dd) * step(.6, o.x) * saturate(u.fx2.x * 2. - .6) * .6;
+    let edge = length((uv - .5) * vec2f(asp, 1.));
+    let f = saturate(u.fx2.x * 1.7 - (.9 - edge) * .9);
+    let fogc = mix(low, vec3f(lum3(low)), .5) * .55 + vec3f(.45);
+    c = mix(c, fogc, f * (1. - drop * .7)) + vec3f(.25) * drop * f * smoothstep(rr * .45, 0., dd + rr * .3);
+  }
+  c *= u.fx.x;
+  c = aces(c);
+  let v = (uv - .5) * vec2f(u.res.x / u.res.y, 1.);
+  c *= 1. - u.fx2.y * smoothstep(.35, 1.2, length(v));
+  c = mix(c, vec3f(1.), saturate(u.fx.y));
+  c = mix(c, vec3f(0.), saturate(u.fx.z));
+  c = srgb(c);
+  let n = hsh(i.pos.xy + fract(u.tm.x * 7.13) * 91.7) - .5;
+  c += n * (1. / 255. + u.fx2.z * .035);
+  return vec4f(c, 1.);
+}
+fn lum3(c: vec3f) -> f32 { return dot(c, vec3f(.2126, .7152, .0722)); }
+`;
+
+const PROFILE = [[0,29],[2,28.8744],[4,28.7522],[6,28.6335],[8,28.5182],[10,28.4064],[12,28.2981],[14,28.1932],[16,28.0917],[18,27.9938],[20,27.8992],[22,27.8082],[24,27.7205],[26,27.6364],[28,27.5556],[30,27.4784],[32,27.4045],[34,27.3342],[36,27.2672],[38,27.2038],[40,27.1437],[42,27.0871],[44,27.034],[46,26.9843],[48,26.938],[50,26.8952],[52,26.8559],[54,26.8199],[56,26.7875],[58,26.7584],[60,26.7328],[62,26.7107],[64,26.6919],[66,26.6767],[68,26.6648],[70,26.6565],[72,26.6515],[74,26.65],[76,26.6519],[78,26.6573],[80,26.6661],[82,26.6784],[84,26.6941],[86,26.7132],[88,26.7358],[90,26.7619],[92,26.7913],[94,26.8242],[96,26.8606],[98,26.9004],[100,26.9436],[102,26.9903],[104,27.0404],[106,27.094],[108,27.151],[110,27.2115],[112,27.2754],[114,27.3428],[116,27.4136],[118,27.4878],[120,27.5655],[122,27.6467],[124,27.7313],[126,27.8193],[128,27.9109],[130,28.0058],[132,28.1042],[134,28.2061],[136,28.3114],[138,28.4202],[140,28.5324],[142,28.6481],[144,28.7673],[146,28.8899],[147.607,28.9909],[147.669,28.9853],[147.726,28.9611],[147.773,28.9207],[147.805,28.868],[148.04,28.304],[148.132,28.1615],[148.224,28.0831],[148.316,28.0351],[148.408,28.0085],[148.5,28],[148.592,28.0085],[148.684,28.0351],[148.776,28.0831],[148.868,28.1615],[148.96,28.304],[149.188,28.85],[149.224,28.9073],[149.278,28.9491],[149.342,28.9705],[149.41,28.9691],[150,28.8595],[150.5,28.7719],[151,28.6891],[151.5,28.6111],[152,28.5378],[152.5,28.4693],[153,28.4055],[153.5,28.3464],[154,28.292],[154.5,28.2423],[155,28.1973],[155.5,28.1568],[156,28.1211],[156.5,28.09],[157,28.0635],[157.5,28.0416],[158,28.0243],[158.5,28.0117],[159,28.0036],[159.5,28.0001],[160,28.0013],[160.5,28.007],[161,28.0174],[161.5,28.0324],[162,28.0519],[162.5,28.0761],[163,28.1049],[163.5,28.1384],[164,28.1765],[164.5,28.2192],[165,28.2666],[165.5,28.3186],[166,28.3754],[166.5,28.4368],[167,28.503],[167.5,28.5739],[168,28.6495],[168.5,28.7299],[169,28.8151],[169.5,28.9051],[169.64,28.9312],[169.772,28.9285],[169.89,28.8696],[169.971,28.7658],[170,28.6372]];
+// ============================================================================
+// hero 3 · the bottle on the lathe (centimetres, the lathe axis along X): the culm piece spins between chuck
+// and tailstock; the cutter turns it to the CAD profile (TUBE_PROFILE), chips fly; the laser engraves, sparks
+// and smoke. Studio light (key softbox, rim strip), shadow map, depth of field in the grade.
+//   g.ex: x spin, y mill x (cm, 0 → 17), z laser x, w laser on     g.mis: exposure, mill on, seed, focus
+// ============================================================================
+const HL_G = /*wgsl*/`
+struct G { vp: mat4x4f, sm: mat4x4f, cam: vec4f, right: vec4f, up: vec4f, fwd: vec4f, sun: vec4f, res: vec4f, mis: vec4f, ex: vec4f };
+@group(0) @binding(0) var<uniform> g: G;
+@group(0) @binding(1) var sR: sampler;
+@group(0) @binding(2) var sS: sampler_comparison;
+@group(0) @binding(3) var tSh: texture_depth_2d;
+@group(0) @binding(4) var tN: texture_2d<f32>;
+@group(0) @binding(5) var<uniform> S: array<vec4f, 128>;
+const PI = 3.14159265;
+fn sat(x: f32) -> f32 { return clamp(x, 0., 1.); }
+fn ss(a: f32, b: f32, x: f32) -> f32 { let t = clamp((x - a) / (b - a), 0., 1.); return t * t * (3. - 2. * t); }
+fn hs(x: f32) -> f32 { return fract(sin(x * 127.1) * 43758.5453); }
+fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(.06711056, .00583715)))); }
+fn nz(p: vec2f) -> vec4f { return textureSampleLevel(tN, sR, p * .0625, 0.); }
+fn tubeR(x: f32) -> f32 { let f = clamp(x / 17., 0., 1.) * 511.; let i = u32(f); let j = min(i + 1u, 511u); return mix(S[i >> 2u][i & 3u], S[j >> 2u][j & 3u], fract(f)); }
+fn culmR(x: f32) -> f32 { return 3.6 + .13 * exp(-(x - .3) * (x - .3) * 4.) + .11 * exp(-(x - 13.8) * (x - 13.8) * 9.) + .03 * sin(x * .4); }
+fn pieceR(x: f32) -> f32 { return mix(culmR(x), tubeR(x), ss(g.ex.y + .025, g.ex.y - .025, x)); }
+fn shadow(p: vec3f) -> f32 {
+  let s = g.sm * vec4f(p, 1.); let u = vec3f(s.x * .5 + .5, .5 - s.y * .5, s.z - .0015); let e = 1.2 / 2048.;
+  var a = 0.;
+  for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) { a += textureSampleCompareLevel(tSh, sS, u.xy + vec2f(f32(x), f32(y)) * e, u.z); } }
+  return a / 9.;
+}
+// the studio: a warm grey sweep, a big key softbox upper left, a rim strip behind right, a low fill card
+const KEY = vec3f(-.55, .62, .56);
+fn sbox(rd: vec3f, k: vec3f, w: vec2f, soft: f32) -> f32 {
+  let kk = normalize(k); let t = normalize(cross(kk, vec3f(0., 1., 0.))); let b = cross(t, kk);
+  let z = dot(rd, kk); if (z <= .05) { return 0.; }
+  let q = abs(vec2f(dot(rd, t), dot(rd, b)) / z) - w;
+  return 1. - smoothstep(-soft, soft * .5, max(q.x, q.y));
+}
+fn env(rd: vec3f) -> vec3f {
+  var c = mix(vec3f(.05, .045, .04), vec3f(.32, .3, .27), ss(-.6, .8, rd.y));
+  c += vec3f(7.5, 7.2, 6.6) * sbox(rd, KEY, vec2f(.5, .36), .08);
+  c += vec3f(3.2, 3.4, 3.8) * sbox(rd, vec3f(.75, .25, -.6), vec2f(.05, .7), .03);
+  c += vec3f(.9, .85, .8) * sbox(rd, vec3f(.1, -.35, 1.), vec2f(.7, .2), .2);
+  return c;
+}
+fn h21(p: vec2f) -> f32 { var q = fract(p * vec2f(.1031, .1030)); q += dot(q, q.yx + 33.33); return fract((q.x + q.y) * q.x); }
+fn vn(p: vec2f) -> f32 { let i = floor(p); let f = fract(p); let u = f * f * (3. - 2. * f);
+  return mix(mix(h21(i), h21(i + vec2f(1., 0.)), u.x), mix(h21(i + vec2f(0., 1.)), h21(i + vec2f(1., 1.)), u.x), u.y); }
+// bamboo fibre along the axis: s around (cm), x along (cm)
+var<private> FW: f32;   // the pixel footprint in cm: finer detail fades out instead of aliasing
+fn fibre(s: f32, x: f32) -> f32 { return mix(.5, vn(vec2f(s * 55., x * 1.6)), ss(.03, .008, FW)) * .5 + mix(.5, vn(vec2f(s * 140., x * 4.)), ss(.012, .003, FW)) * .3 + vn(vec2f(s * 9., x * .3)) * .2; }
+fn fin(c: vec3f) -> vec4f { return vec4f(clamp(c, vec3f(0.), vec3f(60.)), 1.); }
+fn fres(f0: f32, c: f32) -> f32 { let x = 1. - sat(c); let x2 = x * x; return f0 + (1. - f0) * x2 * x2 * x; }
+fn ggx(n: vec3f, v: vec3f, l: vec3f, r: f32) -> f32 { let h = normalize(v + l); let nh = sat(dot(n, h)); let a = max(r * r, .002); let a2 = a * a; let d = nh * nh * (a2 - 1.) + 1.; return a2 / (PI * d * d) * sat(dot(n, l)) * .25 / max(sat(dot(n, v)), .15); }
+fn shade(alb: vec3f, n: vec3f, p: vec3f, rough: f32, spec: f32, sh: f32, ao: f32) -> vec3f {
+  let V = normalize(g.cam.xyz - p); let L = normalize(KEY);
+  var c = alb * (vec3f(3.2, 3.05, 2.8) * sat(dot(n, L)) * sh + env(n) * .35 * ao);
+  c += vec3f(3.2, 3.05, 2.8) * ggx(n, V, L, rough) * sh * spec * 1.6;
+  let r = reflect(-V, n);
+  c += env(r) * fres(.04, dot(n, V)) * spec * mix(.12, 1., 1. - rough) * ao;
+  return c;
+}
+`;
+// ---------------------------------------------------------------- turned parts: the piece (outer, bore, ends), chuck, tailstock
+const HL_TURN = HL_G + /*wgsl*/`
+override SEG: u32 = 160u;
+override RINGS: u32 = 340u;
+struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) lp: vec3f, @location(3) @interpolate(flat) part: u32 };
+fn cor(k: u32) -> vec2u { return vec2u(u32(k == 1u || k == 4u || k == 5u), u32(k == 2u || k == 3u || k == 5u)); }
+// part: 0 piece outer, 1 bore, 2 end face at 17 (annulus), 3 end face at 0, 4 chuck, 5 jaws, 6 tailstock centre
+fn prof(part: u32, u: f32, dr: ptr<function, f32>) -> vec2f {   // (x along the axis in piece space, radius)
+  switch part {
+    case 0u { let x = u * 17.; *dr = (pieceR(x + .02) - pieceR(x - .02)) / .04; return vec2f(x, pieceR(x)); }
+    case 1u { let x = mix(17., .5, u); *dr = 0.; return vec2f(x, 2.4); }
+    case 2u { *dr = 1e3; return vec2f(17., mix(pieceR(17.), 2.4, u)); }
+    case 3u { *dr = -1e3; return vec2f(0., mix(0., pieceR(0.), u)); }
+    case 4u { let x = mix(-7.5, -.6, u); let r = select(select(5.2, 4.6, u > .55), 3.2, u < .12); *dr = 0.; return vec2f(x, r); }
+    case 6u { let x = mix(16.4, 26., u); var r = 1.25; if (u < .12) { r = mix(.35, 2.38, u / .12); } else if (u > .55) { r = 3.1; } *dr = 0.; return vec2f(x, r); }
+    default { return vec2f(0.); }
+  }
+}
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  let q = vi / 6u; let c = cor(vi % 6u);
+  let s = q % SEG + c.x; let r = q / SEG + c.y;
+  let part = ii;
+  let u = f32(r) / f32(RINGS);
+  var dr = 0.;
+  let pr = prof(part, u, &dr);
+  let a0 = f32(s) / f32(SEG) * 2. * PI;
+  let spin = select(g.ex.x, g.ex.x * 0., part == 9u);
+  let a = a0 + spin;
+  let rad = vec3f(0., cos(a), sin(a));
+  var n = normalize(vec3f(-dr, 1., 0.));
+  if (abs(dr) > 100.) { n = vec3f(sign(dr), 0., 0.); }
+  var wn = vec3f(n.x, n.y * rad.y, n.y * rad.z);
+  if (part == 1u) { wn = -rad; }
+  let wp = vec3f(pr.x - 8.5, 0., 0.) + rad * pr.y;
+  var o: VO; o.cp = g.vp * vec4f(wp, 1.); o.wp = wp; o.n = wn; o.lp = vec3f(pr.x, a0, pr.y); o.part = part; return o;
+}
+@vertex fn vsSh(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4f {
+  let q = vi / 6u; let c = cor(vi % 6u);
+  let s = q % SEG + c.x; let r = q / SEG + c.y;
+  var dr = 0.; let pr = prof(ii, f32(r) / f32(RINGS), &dr);
+  let a = f32(s) / f32(SEG) * 2. * PI + g.ex.x;
+  return g.sm * vec4f(vec3f(pr.x - 8.5, 0., 0.) + vec3f(0., cos(a), sin(a)) * pr.y, 1.);
+}
+fn sdSeg2(p: vec2f, a: vec2f, b: vec2f) -> f32 { let pa = p - a; let ba = b - a; return length(pa - ba * sat(dot(pa, ba) / dot(ba, ba))); }
+fn sdLeaf2(p: vec2f, a: vec2f, dir: vec2f, len: f32, w: f32) -> f32 {
+  let t = vec2f(-dir.y, dir.x); let q = vec2f(dot(p - a, dir), dot(p - a, t)); let x = sat(q.x / len);
+  return max(abs(q.y) - w * sin(PI * pow(x, .65)), max(-q.x, q.x - len));
+}
+// the engraving: a bamboo sprig and two rings (s: around the bottle, y: along it); the seed varies each bottle
+fn engr(s: f32, y: f32) -> vec2f {
+  let p = vec2f(s, y);
+  var d = max(abs(s - (-.5 + .22 * sin(y * .45))) - (.028 + .02 * sin(y * 1.9 + 1.) * sin(y * .7)), max(2.4 - y, y - 12.4));
+  var fill = 1e3;
+  for (var k = 0; k < 4; k++) {
+    let fk = f32(k); let ny = 3.6 + fk * 2.25;
+    let a = vec2f(-.5 + .22 * sin(ny * .45), ny);
+
+    let side = select(-1., 1., (k & 1) == 0);
+    let ang = .5 + .3 * hs(fk + g.mis.z * 13.);
+    let dir = normalize(vec2f(side * cos(ang), sin(ang)));
+    let l = sdLeaf2(p, a + vec2f(side * .07, .05), dir, 2.5 - fk * .22, .3);
+    fill = min(fill, l); d = min(d, abs(l) - .022);
+    d = min(d, max(sdSeg2(p, a, a + dir * (2.3 - fk * .22)) - .012, l));
+  }
+  d = min(d, abs(y - 13.3) - .022); d = min(d, abs(y - 13.62) - .016);
+  return vec2f(d, fill);
+}
+@fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+  var n = normalize(i.n); if (!ff) { n = -n; }
+  let x = i.lp.x; let ang = i.lp.y; let R = i.lp.z;
+  FW = length(fwidth(i.wp));
+  let sh = shadow(i.wp + n * .05);
+  var col: vec3f;
+  if (i.part >= 4u) {
+    // machine steel: brushed, a little worn
+    let br = nz(vec2f(ang * 30., x * 3.)).r;
+    col = shade(vec3f(.07, .075, .08) * (.8 + .4 * br), n, i.wp, .34 + .12 * br, .85, sh, select(1., .12, n.x > .5 && i.part == 4u));
+    return fin(col);
+  }
+  let milled = x < g.ex.y;
+  let s = ang * R; let fib = nz(vec2f(s * 6., x * .35)).r; let fib2 = nz(vec2f(s * 24., x * .9) + 3.).g;
+  var alb: vec3f; var rough = .5; var spec = .35;
+  if (i.part == 1u) { alb = vec3f(.62, .5, .3) * (.7 + .3 * fib); rough = .8; }
+  else if (i.part >= 2u) {
+    // end grain: rings of fibre bundles, darker towards the skin
+    let rr = length(vec2f(R, 0.)); let bund = ss(.12, .02, nz(vec2f(ang * 26., R * 9.)).b);
+    alb = mix(vec3f(.72, .6, .38), vec3f(.42, .3, .14), bund * .6 + ss(2.6, 3.1, R) * .5); rough = .8;
+  } else if (milled || x > 16.95) {
+    // fibres and the dark flecks of vascular bundles (elongated along the axis), a micro-relief across them
+    let fb = fibre(s, x); let fbs = fibre(s + .004, x);
+    let bc = vec2f(s * 16., x * 2.2); let bi = floor(bc); let bo = vec2f(h21(bi), h21(bi + 17.)); let bd = length((fract(bc) - .25 - bo * .5) * vec2f(1., 2.8));
+    let bund = ss(.2, .08, bd) * step(.55, h21(bi + 3.)) * ss(.05, .015, FW) * (.4 + .6 * h21(bi + 9.));
+    let fine = ss(.6, .9, vn(vec2f(s * 260., x * 9.))) * ss(.006, .0015, FW);
+    alb = vec3f(.47, .31, .15) * (.8 + .3 * fb) * (.92 + .1 * fib);
+    alb = mix(alb, vec3f(.24, .15, .06), bund * .35 + fine * .08);
+    let tg = normalize(cross(vec3f(1., 0., 0.), n));
+    n = normalize(n + tg * (fbs - fb) * .6 * ss(.02, .004, FW));
+    // the laser: burnt where it has passed, a hot line under the beam
+    let es = (ang - PI * .5) * R;
+    let e = engr(es, x);
+    if (x < g.ex.z) {
+      let ea = engr(es + .006, x).x; let eb = engr(es, x + .006).x;
+      let gr = vec2f(ea - e.x, eb - e.x) / .006;
+      let prof = ss(.03, .0, e.x);                                   // 1 in the groove's bottom
+      let dprof = -ss(.03, .0, e.x) * (1. - ss(.03, .0, e.x)) * 4.;   // its slope
+      n = normalize(n - (tg * gr.x + vec3f(1., 0., 0.) * gr.y) * dprof * .9);
+      let bleed = (fib - .5) * .025 + (bund - .3) * .02;
+      let core = ss(.018, -.004, e.x + bleed * .4);
+      let halo = ss(.16, .0, e.x + bleed * 1.6) * (1. - core);
+      let fl = ss(.012, -.03, e.y) * (.5 + .3 * fib2) * (.75 + .25 * sin(x * 2.3 + es * 1.7));
+      alb = mix(alb, vec3f(.3, .15, .05), halo * .75);
+      alb = mix(alb, vec3f(.24, .12, .045), fl);
+      alb = mix(alb, vec3f(.045, .022, .01), core * .95);
+      // the groove: darker in its bottom, a bright lip where the wood is cut
+      n = normalize(n + vec3f(ss(.03, .0, abs(e.x - .014)) * .5, 0., 0.) * (1. - core));
+      rough = mix(rough, .9, max(core, fl));
+    }
+    // anisotropic sheen along the fibres
+    spec = .22; rough = .62;
+  } else {
+    // the green skin of the culm, waxy, with the white bloom near the node
+    let st = nz(vec2f(x * .5, 3.)).r;
+    alb = mix(vec3f(.04, .075, .018), vec3f(.075, .1, .028), st * .7 + .3 * nz(vec2f(x * 2.2, 7.)).g);
+    alb = mix(alb, vec3f(.12, .13, .05), ss(.55, .8, nz(vec2f(x * .2, 9.)).r) * .3);
+    // spin streaks: the skin's speckles drawn into fine rings; the node ridge and its white bloom
+    alb *= .9 + .2 * vn(vec2f(x * 26., 1.)) * vn(vec2f(x * 61., 3.));
+    let nd = x - 13.8;
+    alb = mix(alb, vec3f(.4, .43, .36), ss(.05, .25, -nd) * ss(.8, .3, -nd) * .55);
+    alb *= 1. - ss(.04, 0., abs(nd)) * .5;
+    alb = mix(alb, vec3f(.45, .48, .4), exp(-(x - .9) * (x - .9) * 2.) * .5 * (.6 + .4 * nz(vec2f(ang * 30., x * 4.)).g));
+    let torn = ss(.06, 0., x - g.ex.y) * ss(.5, .7, nz(vec2f(ang * 40., x * 3.)).r);
+    alb = mix(alb, vec3f(.5, .38, .2), torn * .8);
+    rough = .34; spec = .5;
+  }
+  col = shade(alb, n, i.wp, rough, spec, sh, 1.);
+  // the laser spot lights the wood around it
+  if (g.ex.w > .5 && i.part == 0u) {
+    let lp = vec3f(g.ex.z - 8.5, pieceR(g.ex.z) + .05, 0.); let d = distance(i.wp, lp);
+    col += alb * vec3f(5., 2.2, .7) * sat(dot(n, normalize(lp - i.wp + vec3f(0., .3, 0.)))) / (1. + d * d * 2.5);
+  }
+  // the cutting line glows faintly with friction
+
+  if (g.ex.w > .5 && i.part == 0u) {
+    let d = distance(i.wp, vec3f(g.ex.z - 8.5, pieceR(g.ex.z), 0.));
+    col += vec3f(9., 4., 1.5) * exp(-d * d * 60.) + vec3f(1.5, .5, .15) * exp(-d * 6.) * .5;
+  }
+  return fin(col);
+}
+`;
+// ---------------------------------------------------------------- boxes: the lathe bed, carriage, tool, laser head
+const HL_BOX = HL_G + /*wgsl*/`
+struct BI { @location(0) c: vec4f, @location(1) h: vec4f };
+struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) @interpolate(flat) m: f32 };
+fn boxV(vi: u32, b: BI, n: ptr<function, vec3f>) -> vec3f {
+  let f = vi / 6u; let k = vi % 6u;
+  let c = vec2f(f32(k == 1u || k == 4u || k == 5u), f32(k == 2u || k == 3u || k == 5u)) * 2. - 1.;
+  let ax = f % 3u; let sg = select(-1., 1., f < 3u);
+  var p = vec3f(0.); var nn = vec3f(0.);
+  if (ax == 0u) { p = vec3f(sg, c.x * sg, c.y); nn = vec3f(sg, 0., 0.); }
+  else if (ax == 1u) { p = vec3f(c.y, sg, c.x * sg); nn = vec3f(0., sg, 0.); }
+  else { p = vec3f(c.x * sg, c.y, sg); nn = vec3f(0., 0., sg); }
+  let cr = cos(b.h.w); let sr = sin(b.h.w);
+  let q = p * b.h.xyz; let rq = vec3f(q.x * cr - q.z * sr, q.y, q.x * sr + q.z * cr);
+  *n = vec3f(nn.x * cr - nn.z * sr, nn.y, nn.x * sr + nn.z * cr); return b.c.xyz + rq;
+}
+@vertex fn vs(@builtin(vertex_index) vi: u32, b: BI) -> VO { var n: vec3f; let p = boxV(vi, b, &n); var o: VO; o.cp = g.vp * vec4f(p, 1.); o.wp = p; o.n = n; o.m = b.c.w; return o; }
+@vertex fn vsSh(@builtin(vertex_index) vi: u32, b: BI) -> @builtin(position) vec4f { var n: vec3f; return g.sm * vec4f(boxV(vi, b, &n), 1.); }
+@fragment fn fs(i: VO) -> @location(0) vec4f {
+  let n = normalize(i.n); let sh = shadow(i.wp + n * .25);
+  let br = nz(i.wp.xz * vec2f(3., 3.) + i.wp.y * 2.).r;
+  var alb = vec3f(.03, .032, .035) * (.9 + .2 * br); var rough = .45;
+  if (i.m > .5) { alb = vec3f(.018, .019, .021) * (.9 + .2 * br); rough = .32; }
+  if (i.m > 1.5) { alb = vec3f(.02); rough = .5; }
+  if (i.m > 2.5) { alb = vec3f(.55, .38, .1); rough = .18; }
+  return fin(shade(alb, n, i.wp, rough, 1., sh, 1.));
+}
+`;
+// ---------------------------------------------------------------- particles: chips (lit), sparks and smoke (additive)
+const HL_FX = HL_G + /*wgsl*/`
+struct VO { @builtin(position) cp: vec4f, @location(0) uv: vec2f, @location(1) c: vec4f };
+fn bill(p: vec3f, q: vec2f, sz: vec2f, along: vec3f) -> vec3f {
+  var ax = along; if (length(ax) < 1e-4) { ax = g.right.xyz; }
+  ax = normalize(ax - g.fwd.xyz * dot(ax, g.fwd.xyz));
+  let up = normalize(cross(g.fwd.xyz, ax));
+  return p + ax * q.x * sz.x + up * q.y * sz.y;
+}
+@vertex fn vsChip(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  var o: VO; let q = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2. - 1.;
+  let fi = f32(ii); let life = .9; let t = fract(g.cam.w / life + hs(fi)) * life;
+  if (g.mis.y < .5) { o.cp = vec4f(0., 0., 2., 1.); return o; }
+  let a0 = g.ex.x + hs(fi * 3.) * .6 - .3;
+  let r0 = pieceR(g.ex.y);
+  let p0 = vec3f(g.ex.y - 8.5, -r0 * .2, r0);
+  let v = vec3f((hs(fi * 5.) - .5) * 30., -6. + hs(fi * 7.) * 34., 18. + hs(fi * 11.) * 30.);
+  let p = p0 + v * t + vec3f(0., -490., 0.) * t * t * .5;
+  let spinA = fi + g.cam.w * (10. + hs(fi) * 30.);
+  let sz = vec2f(.25 + hs(fi * 13.) * .4, .05 + hs(fi * 17.) * .03);
+  let w = bill(p, q, sz, vec3f(cos(spinA), sin(spinA), .3));
+  o.cp = g.vp * vec4f(w, 1.); o.uv = q;
+  let green = step(.55, hs(fi * 19.));
+  let lit = .5 + .5 * sin(spinA * 1.7);
+  o.c = vec4f(mix(vec3f(.62, .44, .22), vec3f(.16, .24, .05), green) * (.5 + 2.4 * lit), spinA);
+  return o;
+}
+@fragment fn fsChip(i: VO) -> @location(0) vec4f {
+  // a ribbon that curls: its width narrows and shades along the curl
+  let c = sin(i.uv.x * 3.1 + i.c.a);
+  if (abs(i.uv.y) > .55 + .45 * abs(c) || abs(i.uv.x) > .98) { discard; }
+  let edge = 1. - abs(i.uv.y) * .35;
+  return vec4f(i.c.rgb * (.55 + .45 * c * c) * edge * vec3f(1., .97, .92), 1.);
+}
+@vertex fn vsSpark(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  var o: VO; let q = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2. - 1.;
+  if (g.ex.w < .5) { o.cp = vec4f(0., 0., 2., 1.); return o; }
+  let fi = f32(ii); let life = .18 + hs(fi) * .22; let t = fract(g.cam.w / life + hs(fi * 2.)) * life;
+  let r0 = pieceR(g.ex.z); let p0 = vec3f(g.ex.z - 8.5, r0, 0.);
+  let v = normalize(vec3f(hs(fi * 3.) - .5, .45 + hs(fi * 5.), hs(fi * 7.) - .5)) * (6. + hs(fi * 9.) * 16.);
+  let vel = v + vec3f(0., -490., 0.) * t;
+  let p = p0 + v * t + vec3f(0., -490., 0.) * t * t * .5;
+  if (p.y < r0 - .6) { o.cp = vec4f(0., 0., 2., 1.); return o; }
+  let w = bill(p, q, vec2f(.02 + length(vel) * .007, .004 + hs(fi * 4.) * .003), vel);
+  o.cp = g.vp * vec4f(w, 1.); o.uv = q;
+  let k = 1. - t / life;
+  o.c = vec4f(mix(vec3f(9., 1.6, .25), vec3f(16., 8., 2.2), k) * k * k, 0.);
+  return o;
+}
+@vertex fn vsSmoke(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
+  var o: VO; let q = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2. - 1.;
+  if (g.ex.w < .5) { o.cp = vec4f(0., 0., 2., 1.); return o; }
+  let fi = f32(ii); let life = 2.4; let t = fract(g.cam.w / life + hs(fi)) * life;
+  let r0 = pieceR(g.ex.z); let p0 = vec3f(g.ex.z - 8.5, r0 + .2, 0.);
+  let p = p0 + vec3f(sin(t * 2. + fi) * .6 * t, 3.2 * t, cos(t * 1.7 + fi) * .5 * t);
+  let s = .3 + t * 1.3;
+  let w = p + g.right.xyz * q.x * s + g.up.xyz * q.y * s * 1.6;
+  o.cp = g.vp * vec4f(w, 1.); o.uv = q;
+  let k = (1. - t / life) * ss(0., .3, t);
+  o.c = vec4f(vec3f(.6, .55, .5) * k * .09, fi * 7.31 + t * .4);
+  return o;
+}
+@vertex fn vsBeam(@builtin(vertex_index) vi: u32) -> VO {
+  var o: VO; let q = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2. - 1.;
+  if (g.ex.w < .5) { o.cp = vec4f(0., 0., 2., 1.); return o; }
+  let top = vec3f(g.ex.z - 8.5, 6., 0.); let bot = vec3f(g.ex.z - 8.5, pieceR(g.ex.z), 0.);
+  let p = mix(bot, top, q.y * .5 + .5);
+  let w = p + normalize(cross(g.fwd.xyz, vec3f(0., 1., 0.))) * q.x * .05;
+  o.cp = g.vp * vec4f(w, 1.); o.uv = vec2f(q.x * 2.5, 0.);
+  o.c = vec4f(vec3f(3., .9, .25) * (.55 + .45 * sin(g.cam.w * 90.)), 0.);
+  return o;
+}
+@fragment fn fsAdd(i: VO) -> @location(0) vec4f { let r = dot(i.uv, i.uv); return vec4f(i.c.rgb * exp(-r * 3.) * (1. - ss(.7, 1., r)), 0.); }
+@fragment fn fsSmoke(i: VO) -> @location(0) vec4f {
+  let r = dot(i.uv, i.uv);
+  let w = textureSampleLevel(tN, sR, i.uv * .18 + vec2f(i.c.a, i.c.a * .37) * .05, 0.).r * .6 + textureSampleLevel(tN, sR, i.uv * .45 + vec2f(i.c.a * .7, 0.) * .05, 0.).g * .4;
+  let a = ss(.35, .75, w) * (1. - ss(.3, 1., r));
+  return vec4f(i.c.rgb * a, 0.);
+}
+`;
+// ---------------------------------------------------------------- the background sweep
+const HL_BG = HL_G + /*wgsl*/`
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(i32(i & 1u) * 4 - 1), f32(i32(i >> 1u) * 4 - 1), 0., 1.); }
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let uv = fc.xy * g.res.zw; let nd = vec2f(uv.x * 2. - 1., 1. - uv.y * 2.);
+  let rd = normalize(g.fwd.xyz + g.right.xyz * nd.x * g.right.w + g.up.xyz * nd.y * g.up.w);
+  var c = mix(vec3f(.03, .028, .026), vec3f(.16, .15, .135), ss(-.5, .6, rd.y));
+  c += vec3f(.5, .48, .44) * exp(-dot(nd - vec2f(-.75, .55), nd - vec2f(-.75, .55)) * 2.2) * .35;
+  c *= 1. - .35 * length(nd * vec2f(.6, 1.));
+  let az = atan2(rd.x, -rd.z) * 14.; let el = rd.y * 14.;
+  for (var k = 0; k < 2; k++) {
+    let q = vec2f(az, el) * (1. + f32(k) * .7) + f32(k) * 13.;
+    let id = floor(q); let o = vec2f(hs(id.x * 3.1 + id.y * 7.7), hs(id.x * 5.3 + id.y * 1.9));
+    let dd = length(fract(q) - .5 - (o - .5) * .5);
+    c += mix(vec3f(1., .55, .22), vec3f(.7, .8, 1.), step(.8, o.y)) * ss(.32, .1, dd) * step(.86, o.x) * (.16 - f32(k) * .06) * ss(-.3, .3, rd.y);
+  }
+  return fin(c);
+}
+`;
+// ---------------------------------------------------------------- grade with depth of field
+const HL_POST = HL_G + /*wgsl*/`
+@group(1) @binding(0) var tS: texture_2d<f32>;
+@group(1) @binding(1) var tB: texture_2d<f32>;
+@group(1) @binding(2) var tD1: texture_2d<f32>;
+@group(1) @binding(3) var tD2: texture_2d<f32>;
+@group(1) @binding(4) var tDp: texture_depth_multisampled_2d;
+@group(1) @binding(5) var sC: sampler;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(i32(i & 1u) * 4 - 1), f32(i32(i >> 1u) * 4 - 1), 0., 1.); }
+fn tmap(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), vec3f(0.), vec3f(1.)); }
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let px = vec2i(fc.xy); let uv = fc.xy * g.res.zw;
+  var c = textureLoad(tS, px, 0).rgb;
+  let dp = textureLoad(tDp, px, 0);
+  let z = g.fwd.w / max(dp, 1e-6);
+  let coc = clamp(abs(z - g.mis.w) / z * 16., 0., 2.);
+  c = mix(c, textureSampleLevel(tD1, sC, uv, 0.).rgb, ss(.15, 1., coc));
+  c = mix(c, textureSampleLevel(tD2, sC, uv, 0.).rgb, ss(1., 2., coc));
+  let bl = textureSampleLevel(tB, sC, uv, 0.).rgb;
+  c = mix(c, bl, .04) + bl * .03;
+  c *= g.mis.x;
+  let q = uv - .5; c *= 1. - dot(q, q) * .6;
+  c = tmap(c);
+  let l0 = dot(c, vec3f(.2126, .7152, .0722)); let l = mix(l0, l0 * l0 * (3. - 2. * l0), .5);
+  c *= l / max(l0, 1e-4);
+  c = pow(max(c, vec3f(0.)), vec3f(1. / 2.2));
+  let n = ign(fc.xy + g.cam.w * 60.) + ign(fc.xy + 37. + g.cam.w * 31.) - 1.;
+  return vec4f(c + n / 255. * 1.5, 1.);
+}
+`;
+
+const HL_PROPS = HL_G + /*wgsl*/`
+struct FO { @location(0) c: vec4f, @builtin(frag_depth) d: f32 };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(i32(i & 1u) * 4 - 1), f32(i32(i >> 1u) * 4 - 1), 0., 1.); }
+fn sdRB(p: vec3f, b: vec3f, r: f32) -> f32 { let q = abs(p) - b + r; return length(max(q, vec3f(0.))) + min(max(q.x, max(q.y, q.z)), 0.) - r; }
+fn sdCy(p: vec3f, r: f32, h: f32) -> f32 { let d = vec2f(length(p.xz) - r, abs(p.y) - h); return min(max(d.x, d.y), 0.) + length(max(d, vec2f(0.))); }
+fn sdRhomb(p: vec2f, b: vec2f) -> f32 { let q = abs(p); let h = clamp((-2. * dot(q, b) + dot(b, b)) / dot(b, b), -1., 1.); let d = length(q - .5 * b * vec2f(1. - h, 1. + h)); return d * sign(q.x * b.y + q.y * b.x - b.x * b.y); }
+// materials: 1 anodised black aluminium, 2 dark steel, 3 TiN-coated carbide, 4 lens
+fn map(p: vec3f) -> vec2f {
+  let mx = g.ex.y - 8.5; let lx = g.ex.z - 8.5; let R0 = 3.15;
+  var r = vec2f(1e3, 0.);
+  if (g.mis.y > .5) {
+    let hp = p - vec3f(mx, -.35, R0 + 2.75);
+    let holder = sdRB(hp, vec3f(.55, .42, 2.25), .07);
+    let notch = sdRB(hp - vec3f(0., .42, -1.9), vec3f(.6, .18, .5), .02);
+    var h = max(holder, -notch);
+    // two cap screws holding the insert clamp
+    for (var k = 0; k < 2; k++) {
+      let sp = hp - vec3f(0., .45, -.9 + f32(k) * .9);
+      let head = sdCy(sp, .2, .09);
+      let sock = sdCy(sp - vec3f(0., .1, 0.), .09, .06);
+      let s = max(head, -sock);
+      if (s < r.x) { r = vec2f(s, 2.); }
+    }
+    if (h < r.x) { r = vec2f(h, 1.); }
+    let post = sdRB(p - vec3f(mx, -2.9, 6.6), vec3f(1.3, 1.95, 1.3), .1);
+    if (post < r.x) { r = vec2f(post, 1.); }
+    // the insert: an 80-degree rhombus, a small chamfer, its tip at the cut
+    let ip = p - vec3f(mx, .13, R0 + .62);
+    let rh = sdRhomb(vec2f(ip.x, ip.z), vec2f(.55, .9));
+    let ins = max(rh, abs(ip.y) - .1) - .015;
+    if (ins < r.x) { r = vec2f(ins, 3.); }
+  }
+  if (g.ex.z > 0. && g.ex.z < 17.5) {
+    let lp = p - vec3f(lx, 9.4, 0.);
+    var body = sdRB(lp, vec3f(1.6, 1.5, 1.6), .18);
+    // cooling fins along one side
+    let fq = vec3f(lp.x + 1.75, lp.y - 0., lp.z);
+    let fin = sdRB(vec3f(fq.x, (fract(lp.y / .32 + .5) - .5) * .32, fq.z), vec3f(.28, .045, 1.35), .02);
+    body = min(body, max(fin, abs(lp.y) - 1.2));
+    if (body < r.x) { r = vec2f(body, 1.); }
+    let np = p - vec3f(lx, 7.15, 0.);
+    let k = saturate((np.y + .9) / 1.8);
+    let noz = sdCy(np, mix(.16, .42, k), .9) * .8;
+    if (noz < r.x) { r = vec2f(noz, 2.); }
+    let lens = sdCy(p - vec3f(lx, 6.24, 0.), .12, .03);
+    if (lens < r.x) { r = vec2f(lens, 4.); }
+  }
+  return r;
+}
+fn nrm(p: vec3f) -> vec3f { let e = vec2f(.003, -.003); return normalize(e.xyy * map(p + e.xyy).x + e.yyx * map(p + e.yyx).x + e.yxy * map(p + e.yxy).x + e.xxx * map(p + e.xxx).x); }
+fn sph(ro: vec3f, rd: vec3f, c: vec3f, r: f32) -> vec2f { let oc = ro - c; let b = dot(oc, rd); let h = b * b - dot(oc, oc) + r * r; if (h < 0.) { return vec2f(1e9, -1e9); } let s = sqrt(h); return vec2f(-b - s, -b + s); }
+@fragment fn fs(@builtin(position) fc: vec4f) -> FO {
+  let uv = fc.xy * g.res.zw; let nd = vec2f(uv.x * 2. - 1., 1. - uv.y * 2.);
+  let rd = normalize(g.fwd.xyz + g.right.xyz * nd.x * g.right.w + g.up.xyz * nd.y * g.up.w);
+  let ro = g.cam.xyz;
+  // only where a part can be: bounding spheres around the tool and the laser head
+  var b = vec2f(1e9, -1e9);
+  if (g.mis.y > .5) { let s = sph(ro, rd, vec3f(g.ex.y - 8.5, -1.6, 5.6), 3.4); b = vec2f(min(b.x, s.x), max(b.y, s.y)); }
+  if (g.ex.z > 0. && g.ex.z < 17.5) { let s = sph(ro, rd, vec3f(g.ex.z - 8.5, 8.5, 0.), 3.3); b = vec2f(min(b.x, s.x), max(b.y, s.y)); }
+  if (b.y < 0.) { discard; }
+  var t = max(b.x, 0.); var hit = -1.;
+  for (var k = 0; k < 96; k++) {
+    let h = map(ro + rd * t);
+    if (h.x < .002 * (1. + t * .02)) { hit = h.y; break; }
+    t += h.x; if (t > b.y) { break; }
+  }
+  if (hit < 0.) { discard; }
+  let p = ro + rd * t; let n = nrm(p);
+  let ip2 = p - vec3f(g.ex.y - 8.5, .13, 3.15 + .62);
+  let sh = shadow(p + n * .15);
+  let ao = saturate(map(p + n * .25).x / .25) * .5 + .5;
+  var al = vec3f(.04, .041, .044); var rough = .3; var spec = 1.; var e = vec3f(0.);
+  let brush = vn(p.xz * 9. + p.y * 7.) * .5 + .25;
+  if (hit < 1.5) { al *= .8 + .45 * brush; rough = .3 + .14 * brush; }
+  else if (hit < 2.5) { al = vec3f(.05, .052, .055); rough = .2; }
+  else if (hit < 3.5) { al = mix(vec3f(.07, .065, .06), vec3f(.55, .4, .12), ss(.05, -.01, max(abs(ip2.x), abs(ip2.z)) - .5)); rough = .28; spec = 1.2; }
+  else { al = vec3f(.01); rough = .05; e = vec3f(2.5, .7, .2) * g.ex.w; }
+  var c = shade(al, n, p, rough, spec, sh, ao) + e;
+  // edges catch the key light: a thin bevel highlight
+  c += vec3f(.6, .58, .55) * pow(1. - saturate(abs(dot(n, normalize(g.cam.xyz - p)))), 6.) * .25;
+  var o: FO; o.c = fin(c); o.d = g.fwd.w / max(dot(p - ro, g.fwd.xyz), 1e-4); return o;
+}
+`;
+
+// ============================================================================
+// lathe hero host: ?pose=mill|laser|done|close  ?shot  ?bench  ?t
+// ============================================================================
+(async () => {
+  const q = new URLSearchParams(location.search);
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const hasTS = adapter.features.has('timestamp-query');
+  const device = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [] });
+  const Q = device.queue, TU = GPUTextureUsage, BU = GPUBufferUsage, SS = GPUShaderStage;
+  const canvas = document.querySelector('canvas'), ctx = canvas.getContext('webgpu'), FMT = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format: FMT, alphaMode: 'opaque', usage: TU.RENDER_ATTACHMENT | TU.COPY_SRC });
+  const HDR = 'rgba16float', DEPTH = 'depth32float', MS = 4, SHN = 2048;
+  device.addEventListener('uncapturederror', (e) => console.error(e.error.message));
+  const mod = async (code, name) => { const m = device.createShaderModule({ code }); for (const x of (await m.getCompilationInfo()).messages) if (x.type === 'error') console.error(`${name} ${x.lineNum}:${x.linePos} ${x.message}`); return m; };
+  const tN = device.createTexture({ size: [256, 256], format: 'rgba8unorm', usage: TU.STORAGE_BINDING | TU.TEXTURE_BINDING });
+  { const m = await mod(W_NOISE, 'noise'); const p = device.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: 'main' } });
+    const e = device.createCommandEncoder(), c = e.beginComputePass(); c.setPipeline(p); c.setBindGroup(0, device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: tN.createView() }] })); c.dispatchWorkgroups(32, 32); c.end(); Q.submit([e.finish()]); }
+  // the CAD profile, 512 radii (cm)
+  const SD = new Float32Array(512);
+  for (let i = 0; i < 512; i++) { const y = i / 511 * 170; let j = 1; while (j < PROFILE.length - 1 && PROFILE[j][0] < y) j++; const [y0, r0] = PROFILE[j - 1], [y1, r1] = PROFILE[j]; SD[i] = (r0 + (r1 - r0) * Math.min(1, Math.max(0, (y - y0) / (y1 - y0 || 1)))) / 10; }
+  const sbo = device.createBuffer({ size: 2048, usage: BU.UNIFORM | BU.COPY_DST }); Q.writeBuffer(sbo, 0, SD);
+  const G = new Float32Array(64), gbuf = device.createBuffer({ size: 256, usage: BU.UNIFORM | BU.COPY_DST });
+  const GS = new Float32Array(64), gbufS = device.createBuffer({ size: 256, usage: BU.UNIFORM | BU.COPY_DST });
+  const sR = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear' });
+  const sC = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const sS = device.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
+  const tSh = device.createTexture({ size: [SHN, SHN], format: DEPTH, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+  const tShD = device.createTexture({ size: [1, 1], format: DEPTH, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+  const VF = SS.VERTEX | SS.FRAGMENT;
+  const bgl0 = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: VF, buffer: {} }, { binding: 1, visibility: VF, sampler: {} }, { binding: 2, visibility: VF, sampler: { type: 'comparison' } },
+    { binding: 3, visibility: VF, texture: { sampleType: 'depth' } }, { binding: 4, visibility: VF, texture: {} }, { binding: 5, visibility: VF, buffer: {} }] });
+  const mk0 = (u, sh) => device.createBindGroup({ layout: bgl0, entries: [{ binding: 0, resource: { buffer: u } }, { binding: 1, resource: sR }, { binding: 2, resource: sS }, { binding: 3, resource: sh.createView() }, { binding: 4, resource: tN.createView() }, { binding: 5, resource: { buffer: sbo } }] });
+  const bg0 = mk0(gbuf, tSh), bg0S = mk0(gbufS, tShD), pl0 = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+  const bglP = device.createBindGroupLayout({ entries: [0, 1, 2, 3].map((b) => ({ binding: b, visibility: SS.FRAGMENT, texture: {} })).concat([{ binding: 4, visibility: SS.FRAGMENT, texture: { sampleType: 'depth', multisampled: true } }, { binding: 5, visibility: SS.FRAGMENT, sampler: {} }]) });
+  const [mT, mBx, mFx, mBg, mP, mB, mPr] = await Promise.all([[HL_TURN, 'turn'], [HL_BOX, 'box'], [HL_FX, 'fx'], [HL_BG, 'bg'], [HL_POST, 'post'], [W_BLIT, 'blit'], [HL_PROPS, 'props']].map(([c, n]) => mod(c, n)));
+  const DS = { format: DEPTH, depthWriteEnabled: true, depthCompare: 'greater' };
+  const ADD = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
+  const pipe = (m, vs, fs, o = {}) => device.createRenderPipeline({ layout: pl0, vertex: { module: m, entryPoint: vs, buffers: o.buf || [], constants: o.c },
+    fragment: { module: m, entryPoint: fs, targets: [{ format: HDR, blend: o.add ? ADD : undefined }] }, primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: 'none' },
+    depthStencil: o.bg ? { format: DEPTH, depthWriteEnabled: false, depthCompare: 'always' } : o.add ? { format: DEPTH, depthWriteEnabled: false, depthCompare: 'greater' } : DS, multisample: { count: MS } });
+  const shp = (m, o = {}) => device.createRenderPipeline({ layout: pl0, vertex: { module: m, entryPoint: 'vsSh', buffers: o.buf || [], constants: o.c }, primitive: { topology: 'triangle-list' },
+    depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2 } });
+  const BB = [{ arrayStride: 32, stepMode: 'instance', attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }, { shaderLocation: 1, offset: 16, format: 'float32x4' }] }];
+  const pTurn = pipe(mT, 'vs', 'fs', { c: { SEG: 200, RINGS: 420 } }), pBox = pipe(mBx, 'vs', 'fs', { buf: BB }), pBg = pipe(mBg, 'vs', 'fs', { bg: true });
+  const pChip = pipe(mFx, 'vsChip', 'fsChip', { strip: true }), pSpark = pipe(mFx, 'vsSpark', 'fsAdd', { strip: true, add: true }), pSmoke = pipe(mFx, 'vsSmoke', 'fsSmoke', { strip: true, add: true }), pBeam = pipe(mFx, 'vsBeam', 'fsAdd', { strip: true, add: true }), pProps = pipe(mPr, 'vs', 'fs');
+  const sTurn = shp(mT, { c: { SEG: 64, RINGS: 120 } }), sBox = shp(mBx, { buf: BB });
+  const pPost = device.createRenderPipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglP] }), vertex: { module: mP, entryPoint: 'vs' }, fragment: { module: mP, entryPoint: 'fs', targets: [{ format: FMT }] } });
+  const blit = (e, add) => device.createRenderPipeline({ layout: 'auto', vertex: { module: mB, entryPoint: 'vs' }, fragment: { module: mB, entryPoint: e, targets: [{ format: HDR, blend: add ? ADD : undefined }] } });
+  const pDown0 = blit('fsDown0'), pDown = blit('fsDown'), pCopy = blit('fsCopy'), pUp = blit('fsUp', true);
+  const scOne = device.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST }); Q.writeBuffer(scOne, 0, new Float32Array([1, 1, 0, 0]));
+  const boxes = new Float32Array(16 * 8), bbuf = device.createBuffer({ size: boxes.byteLength, usage: BU.VERTEX | BU.COPY_DST });
+  // ---------------------------------------------------------------- poses
+  const P = {
+    mill: { cam: [[-6.5, 6.5, 15], [-1.3, -.2, 2.2], 36], mill: .45, laser: -1, millOn: 1, focus: 15 },
+    laser: { cam: [[3, 13, 15], [.6, 1.6, 0], 34], mill: 1.1, laser: .42, millOn: 0, focus: 19 },
+    done: { cam: [[1, 2, 21], [.5, .2, 0], 30], mill: 1.1, laser: 1.1, millOn: 0, focus: 20.5 },
+    close: { cam: [[-4, 9, 11], [-1.2, 1.8, 0], 34], mill: 1.1, laser: .7, millOn: 0, focus: 14.5 },
+  };
+  const pose = P[q.get('pose') || 'mill'];
+  // ---------------------------------------------------------------- targets
+  let W = 0, H = 0, T = {};
+  function targets() {
+    const r = canvas.getBoundingClientRect(), dpr = Math.min(devicePixelRatio, 2), w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+    if (w === W && h === H) return; W = canvas.width = w; H = canvas.height = h;
+    const tx = (a, b, f = HDR, u = TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, s = 1) => device.createTexture({ size: [a, b], format: f, usage: u, sampleCount: s });
+    T = { ms: tx(W, H, HDR, TU.RENDER_ATTACHMENT, MS), dp: tx(W, H, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, MS), col: tx(W, H), down: [], up: [] };
+    for (let n = 0; n < 5; n++) { const s = [Math.max(1, W >> (n + 1)), Math.max(1, H >> (n + 1))]; T.down.push(tx(...s)); T.up.push(tx(...s)); }
+    const bb = (p, t) => device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView() }, { binding: 1, resource: sC }, { binding: 2, resource: { buffer: scOne } }] });
+    T.bgDown = [bb(pDown0, T.col), ...T.down.slice(0, 4).map((t) => bb(pDown, t))]; T.bgCopy = T.down.map((t) => bb(pCopy, t)); T.bgUp = [0, 1, 2, 3].map((n) => bb(pUp, n === 3 ? T.down[4] : T.up[n + 1]));
+    T.bgP = device.createBindGroup({ layout: bglP, entries: [{ binding: 0, resource: T.col.createView() }, { binding: 1, resource: T.up[0].createView() }, { binding: 2, resource: T.down[0].createView() }, { binding: 3, resource: T.down[1].createView() }, { binding: 4, resource: T.dp.createView() }, { binding: 5, resource: sC }] });
+  }
+  const KEY = (() => { const v = [-.55, .62, .56], l = Math.hypot(...v); return v.map((c) => c / l); })();
+  function camera(t) {
+    const [[cx, cy, cz], tg, fov] = pose.cam;
+    let fx = tg[0] - cx, fy = tg[1] - cy, fz = tg[2] - cz; const fl = Math.hypot(fx, fy, fz); fx /= fl; fy /= fl; fz /= fl;
+    let rx = -fz, rz = fx; const rl = Math.hypot(rx, rz); rx /= rl; rz /= rl;
+    const ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
+    const ty = Math.tan(fov * Math.PI / 360), tx = ty * W / H, n = .05;
+    const V = [rx, ux, -fx, 0, 0, uy, -fy, 0, rz, uz, -fz, 0, -(rx * cx + rz * cz), -(ux * cx + uy * cy + uz * cz), fx * cx + fy * cy + fz * cz, 1];
+    const Pm = [1 / tx, 0, 0, 0, 0, 1 / ty, 0, 0, 0, 0, 0, -1, 0, 0, n, 0];
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += Pm[k * 4 + j] * V[i * 4 + k]; G[i * 4 + j] = s; }
+    G.set([cx, cy, cz, t], 32); G.set([rx, 0, rz, tx], 36); G.set([ux, uy, uz, ty], 40); G.set([fx, fy, fz, n], 44);
+    G.set([...KEY, 1], 48); G.set([W, H, 1 / W, 1 / H], 52);
+    const millX = pose.mill * 17, laserX = pose.laser * 17;
+    G.set([+(q.get('exp') || .58), pose.millOn, .37, pose.focus], 56); G.set([t * 9.5, millX, laserX, pose.laser > 0 && pose.laser < 1 ? 1 : 0], 60);
+    // key-light shadow box
+    const L = KEY, R = 26, lr = [L[2], 0, -L[0]], ll = Math.hypot(...lr); lr[0] /= ll; lr[2] /= ll;
+    const lu = [L[1] * lr[2], L[2] * lr[0] - L[0] * lr[2], -L[1] * lr[0]];
+    const d0 = -40, d1 = 40, m = G.subarray(16, 32);
+    m[0] = lr[0] / R; m[4] = lr[1] / R; m[8] = lr[2] / R; m[12] = 0; m[1] = lu[0] / R; m[5] = lu[1] / R; m[9] = lu[2] / R; m[13] = 0;
+    m[2] = -L[0] / (d1 - d0); m[6] = -L[1] / (d1 - d0); m[10] = -L[2] / (d1 - d0); m[14] = d1 / (d1 - d0); m[3] = m[7] = m[11] = 0; m[15] = 1;
+    GS.set(G); for (let i = 0; i < 16; i++) GS[i] = G[16 + i];
+    // the machine: bed, ways, carriage + tool post + cutter (follows the mill), laser head (follows the laser)
+    const R0 = 3.15, mx = millX - 8.5, lx = (pose.laser > 0 ? laserX : 22) - 8.5;
+    boxes.set([0, -10, 0, 0, 24, 1.4, 5, 0,  0, -8.3, 2.6, 1, 24, .3, .7, 0,  0, -8.3, -2.6, 1, 24, .3, .7, 0,
+      mx, -6.8, 6, 0, 2.6, 1.2, 3, 0,  mx, -3.4, 6.4, 1, 1.4, 2.2, 1.4, 0,  mx, -.35, R0 + 2.7, 1, .55, .45, 2.2, 0,  mx, -.05, R0 + .45, 3, .42, .1, .42, .785,
+      lx, 9.6, 0, 2, 1.7, 1.6, 1.7, 0,  lx, 6.9, 0, 1, .32, .9, .32, 0,  lx, 7.9, 0, 1, .7, .18, .7, 0,
+      ...[0, 1, 2, 3, 4].flatMap((k) => [lx - 1.95, 8.6 + k * .5, 0, 1, .22, .07, 1.5, 0]), lx, 11.5, 0, 0, 1.2, .3, 1.2, 0]);
+  }
+  const att = (view, resolve) => ({ view, resolveTarget: resolve, loadOp: 'clear', storeOp: resolve ? 'discard' : 'store', clearValue: [0, 0, 0, 1] });
+  const QS = hasTS ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null, qRes = device.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC }), qRd = device.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST });
+  let frames = 0; const tFixed = q.get('t') ? +q.get('t') : null, t0 = performance.now();
+  const VT = 200 * 420 * 6, VS = 64 * 120 * 6;
+  async function frame(now) {
+    targets();
+    const t = tFixed ?? (now - t0) / 1000;
+    camera(t); Q.writeBuffer(gbuf, 0, G); Q.writeBuffer(gbufS, 0, GS); Q.writeBuffer(bbuf, 0, boxes);
+    const e = device.createCommandEncoder();
+    let p = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: tSh.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' }, timestampWrites: QS ? { querySet: QS, beginningOfPassWriteIndex: 0 } : undefined });
+    p.setBindGroup(0, bg0S); p.setPipeline(sTurn); for (const k of [0, 2, 3, 4, 6]) p.draw(VS, 1, 0, k);
+    p.setPipeline(sBox); p.setVertexBuffer(0, bbuf); p.draw(36, 4); p.end();
+    p = e.beginRenderPass({ colorAttachments: [att(T.ms.createView(), T.col.createView())], depthStencilAttachment: { view: T.dp.createView(), depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+    p.setBindGroup(0, bg0);
+    p.setPipeline(pBg); p.draw(3);
+    p.setPipeline(pTurn); for (const k of [0, 1, 2, 3, 4, 6]) p.draw(VT, 1, 0, k);
+    p.setPipeline(pBox); p.setVertexBuffer(0, bbuf); p.draw(36, 4);
+    p.setPipeline(pProps); p.draw(3);
+    p.setPipeline(pChip); p.draw(4, 140);
+    p.setPipeline(pSmoke); p.draw(4, 70);
+    p.setPipeline(pSpark); p.draw(4, 260);
+    p.setPipeline(pBeam); p.draw(4, 1);
+    p.end();
+    for (let n = 0; n < 5; n++) { p = e.beginRenderPass({ colorAttachments: [att(T.down[n].createView())] }); p.setPipeline(n ? pDown : pDown0); p.setBindGroup(0, T.bgDown[n]); p.draw(3); p.end(); }
+    for (let n = 3; n >= 0; n--) { p = e.beginRenderPass({ colorAttachments: [att(T.up[n].createView())] }); p.setPipeline(pCopy); p.setBindGroup(0, T.bgCopy[n]); p.draw(3); p.setPipeline(pUp); p.setBindGroup(0, T.bgUp[n]); p.draw(3); p.end(); }
+    const tex = ctx.getCurrentTexture();
+    p = e.beginRenderPass({ colorAttachments: [att(tex.createView())], timestampWrites: QS ? { querySet: QS, endOfPassWriteIndex: 1 } : undefined }); p.setPipeline(pPost); p.setBindGroup(0, bg0); p.setBindGroup(1, T.bgP); p.draw(3); p.end();
+    frames++;
+    const shot = q.get('shot'); let rb = null;
+    if (shot && frames === 6) { const bpr = Math.ceil(W * 4 / 256) * 256; rb = device.createBuffer({ size: bpr * H, usage: BU.MAP_READ | BU.COPY_DST }); e.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow: bpr }, [W, H]); rb.bpr = bpr; }
+    if (QS) { e.resolveQuerySet(QS, 0, 2, qRes, 0); e.copyBufferToBuffer(qRes, 0, qRd, 0, 16); }
+    Q.submit([e.finish()]);
+    if (q.get('bench')) {
+      await qRd.mapAsync(GPUMapMode.READ); const tt = new BigUint64Array(qRd.getMappedRange()); const ms = Number(tt[1] - tt[0]) / 1e6; qRd.unmap();
+      (window.__ms ||= []).push(ms);
+      if (window.__ms.length === 120) { const v = window.__ms.slice(30).sort((x, y) => x - y); window.__bench = { avg: v.reduce((x, y) => x + y) / v.length, p99: v[Math.floor(v.length * .99)], max: v.at(-1), res: [W, H] }; window.__done = true; return; }
+    }
+    if (rb) {
+      await rb.mapAsync(GPUMapMode.READ);
+      const src = new Uint8Array(rb.getMappedRange()), img = new ImageData(W, H), d = img.data, bgra = FMT === 'bgra8unorm';
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const s = y * rb.bpr + x * 4, o = (y * W + x) * 4; d[o] = src[s + (bgra ? 2 : 0)]; d[o + 1] = src[s + 1]; d[o + 2] = src[s + (bgra ? 0 : 2)]; d[o + 3] = 255; }
+      const cv = new OffscreenCanvas(W, H); cv.getContext('2d').putImageData(img, 0, 0);
+      const blob = await cv.convertToBlob({ type: 'image/jpeg', quality: .92 });
+      await fetch('/save?name=' + shot + '.jpg', { method: 'POST', body: await new Promise((r) => { const f = new FileReader(); f.onload = () => r(f.result); f.readAsDataURL(blob); }) });
+      window.__done = true; return;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
