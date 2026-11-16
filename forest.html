@@ -403,8 +403,9 @@ const HF_POST = HF_G + /*wgsl*/`
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(i32(i & 1u) * 4 - 1), f32(i32(i >> 1u) * 4 - 1), 0., 1.); }
 fn tmap(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), vec3f(0.), vec3f(1.)); }
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
-  let px = vec2i(fc.xy); let uv = fc.xy * g.res.zw;
-  var c = textureLoad(tS, px, 0).rgb;
+  // the scene may render below canvas resolution (g.ex.x = share): sample it scaled up
+  let uv = fc.xy * g.res.zw * g.ex.x;
+  var c = textureSampleLevel(tS, sC, uv, 0.).rgb;
   let r = textureSampleLevel(tR, sC, uv, 0.).rgb;
   c += r;
   let bl = textureSampleLevel(tB, sC, uv, 0.).rgb;
@@ -643,7 +644,7 @@ fn store(k: u32, i: u32, a: vec4f, b: vec4f) {
     const P = [1 / tx, 0, 0, 0, 0, 1 / ty, 0, 0, 0, 0, 0, -1, 0, 0, n, 0];
     for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += P[k * 4 + j] * V[i * 4 + k]; G[i * 4 + j] = s; }
     G.set([cx, cy, cz, t], 32); G.set([rx, ry, rz, tx], 36); G.set([ux, uy, uz, ty], 40); G.set([fx, fy, fz, n], 44);
-    G.set([...SUN, 1], 48); G.set([T.rw, T.rh, 1 / T.rw, 1 / T.rh], 52); G.set([+(q.get('exp') || .9), +(q.get('rays') || 1), +(q.get('fog') || .007), 0], 56);
+    G.set([...SUN, 1], 48); G.set([T.rw, T.rh, 1 / T.rw, 1 / T.rh], 52); G.set([scale, 0, 0, 0], 60); G.set([+(q.get('exp') || .9), +(q.get('rays') || 1), +(q.get('fog') || .007), 0], 56);
     // sun shadow: orthographic box of 2R around the camera, snapped to texels
     const L = SUN, R = 34 + Math.max(0, cy - 8) * 2.2, lr = [L[2], 0, -L[0]], ll = Math.hypot(...lr); lr[0] /= ll; lr[2] /= ll;
     const lu = [L[1] * lr[2] - L[2] * lr[1], L[2] * lr[0] - L[0] * lr[2], L[0] * lr[1] - L[1] * lr[0]];

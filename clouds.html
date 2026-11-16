@@ -390,7 +390,7 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(.06711056
 fn tmap(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), vec3f(0.), vec3f(1.)); }
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let uv = fc.xy / vec2f(textureDimensions(tS)) * vec2f(textureDimensions(tS)) / (g.res.xy / g.res.xy) ;
-  let u2 = fc.xy * g.res.zw;
+  let u2 = fc.xy * g.res.zw * g.mis.z;
   var c = textureSampleLevel(tS, sC, u2, 0.).rgb;
   let bl = textureSampleLevel(tB, sC, u2, 0.).rgb;
   c = mix(c, bl, .06) + bl * .035;
@@ -487,7 +487,7 @@ fn tmap(x: vec3f) -> vec3f { return clamp((x * (2.51 * x + .03)) / (x * (2.43 * 
     for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += P[k * 4 + j] * V[i * 4 + k]; G[i * 4 + j] = s; }
     G.set(first ? G.subarray(0, 16) : PV, 16);
     G.set([cx, cy, cz, t], 32); G.set([rx, 0, rz, tx], 36); G.set([ux, uy, uz, ty], 40); G.set([fx, fy, fz, n], 44);
-    G.set([...SUN, 1], 48); G.set([T.rw, T.rh, 1 / T.rw, 1 / T.rh], 52); G.set([+(q.get('exp') || .7), frames, 0, first || q.get('nohist') ? 0 : 1], 56); G.set([0, -2.4, 3, 0], 60);
+    G.set([...SUN, 1], 48); G.set([T.rw, T.rh, 1 / T.rw, 1 / T.rh], 52); G.set([+(q.get('exp') || .7), frames, scale, first || q.get('nohist') ? 0 : 1], 56); G.set([0, -2.4, 3, 0], 60);
   }
   const QS = hasTS ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null, qRes = device.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC }), qRd = device.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST });
   const att = (view) => ({ view, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] });
